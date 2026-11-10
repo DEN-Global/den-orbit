@@ -1,0 +1,9 @@
+node_modules
+.next
+out
+dist
+.env*
+!.env.example
+.agents/
+skills-lock.json
+npm-debug.log*
