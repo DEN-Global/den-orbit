@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { IntentToken, Purchase, QuoteResponse, Schedule } from "@/types/dca";
 
-const STORE_KEY = "orbit-dca-v1";
 const TARGETS = ["BTC", "ETH", "NEAR"];
 const TERMINAL = new Set(["SUCCESS", "FAILED", "REFUNDED", "INCOMPLETE_DEPOSIT"]);
 
@@ -60,7 +59,9 @@ export default function Home() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [loadingTokens, setLoadingTokens] = useState(true);
-  const [hydrated, setHydrated] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const csrfRef = useRef("");
   const [tokenError, setTokenError] = useState("");
   const [originId, setOriginId] = useState("");
   const [targetSymbol, setTargetSymbol] = useState("BTC");
@@ -77,31 +78,31 @@ export default function Home() {
   const [quoteSource, setQuoteSource] = useState<IntentToken | null>(null);
   const [quoteTarget, setQuoteTarget] = useState<IntentToken | null>(null);
 
+  async function api(path: string, init: RequestInit = {}) {
+    const headers = new Headers(init.headers);
+    if (init.body) headers.set("Content-Type", "application/json");
+    if (init.method && init.method !== "GET") headers.set("x-csrf-token", csrfRef.current);
+    const response = await fetch(`/api${path}`, { ...init, headers, credentials: "same-origin", cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error ?? data.message ?? "DEN request failed.");
+    return data;
+  }
+
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORE_KEY) ?? "{}");
-      setSchedules(Array.isArray(saved.schedules) ? saved.schedules : []);
-      setPurchases(Array.isArray(saved.purchases) ? saved.purchases : []);
-    } catch { /* Start with an empty local workspace if saved data is unreadable. */ }
-    setHydrated(true);
-    fetch("/api/intents/tokens")
-      .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error ?? "The supported asset list is unavailable.");
-        if (!Array.isArray(data)) throw new Error(data.message ?? data.error ?? "The supported asset list is unavailable.");
-        setTokens(data);
-        const usdc = data.find((token: IntentToken) => token.symbol.toUpperCase() === "USDC" && token.blockchain.toLowerCase() === "eth")
-          ?? data.find((token: IntentToken) => token.symbol.toUpperCase() === "USDC");
+    fetch("/api/auth/me", { credentials: "same-origin", cache: "no-store" })
+      .then(async response => { if (!response.ok) throw new Error("Sign in to DEN to open Orbit."); return response.json(); })
+      .then(async data => {
+        csrfRef.current = data.csrfToken; setAuthenticated(true);
+        const [tokenData, plans, activity] = await Promise.all([api("/orbit/tokens"), api("/orbit/schedules"), api("/orbit/swaps")]);
+        const list = Array.isArray(tokenData) ? tokenData : tokenData.tokens;
+        setTokens(list);
+        setSchedules(plans.schedules ?? []); setPurchases(activity.swaps ?? []);
+        const usdc = list.find((token: IntentToken) => token.symbol.toUpperCase() === "USDC" && token.blockchain.toLowerCase() === "eth") ?? list.find((token: IntentToken) => token.symbol.toUpperCase() === "USDC");
         if (usdc) setOriginId(usdc.assetId);
       })
       .catch((reason: Error) => setTokenError(reason.message))
-      .finally(() => setLoadingTokens(false));
+      .finally(() => { setAuthLoading(false); setLoadingTokens(false); });
   }, []);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORE_KEY, JSON.stringify({ schedules, purchases }));
-  }, [hydrated, schedules, purchases]);
 
   const originTokens = useMemo(() => tokens.filter((token) => token.symbol.toUpperCase() === "USDC"), [tokens]);
   const targetTokens = useMemo(() => {
@@ -119,6 +120,9 @@ export default function Home() {
   const invested = purchases.filter((purchase) => purchase.status === "SUCCESS").reduce((sum, purchase) => sum + Number(purchase.amountIn || 0), 0);
   const nextSchedule = schedules.filter((schedule) => schedule.active).sort((a, b) => a.nextRun.localeCompare(b.nextRun))[0];
 
+  if (authLoading) return <main className="shell"><p>Opening your DEN workspace…</p></main>;
+  if (!authenticated) return <main className="shell"><section className="hero-copy"><div className="eyebrow">DEN AUTHENTICATION REQUIRED</div><h1>Sign in to open<br /><em>your Orbit workspace.</em></h1><p>{tokenError || "Your plans and swap history are private to your DEN account."}</p><a className="text-link" href="/consumer/">Sign in to DEN ↗</a></section></main>;
+
   async function requestQuote(dry: boolean, schedule?: Schedule) {
     setBusy(true); setError(""); setNotice(""); setQuote(null);
     try {
@@ -132,7 +136,7 @@ export default function Home() {
       if (!to || !refund) throw new Error("Add the destination address and source-chain refund address first.");
       if (!/^\d+(\.\d+)?$/.test(qty) || !Number.isFinite(Number(qty)) || Number(qty) <= 0) throw new Error("Enter an amount greater than zero using digits and a decimal point.");
       if (!Number.isInteger(tolerance) || tolerance < 1 || tolerance > 5000) throw new Error("Slippage must be from 1 to 5,000 basis points.");
-      const response = await fetch("/api/intents/quote", {
+      const response = await api("/orbit/quote", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           dry, swapType: "EXACT_INPUT", originAsset: source.assetId, destinationAsset: destination.assetId,
@@ -142,8 +146,7 @@ export default function Home() {
           slippageTolerance: tolerance, deadline: new Date(Date.now() + 8 * 60 * 1000).toISOString(),
         }),
       });
-      const data: QuoteResponse & { error?: string; message?: string } = await response.json();
-      if (!response.ok) throw new Error(data.error ?? data.message ?? "1Click could not return a quote.");
+      const data: QuoteResponse = response;
       setQuote(data); setQuoteSource(source); setQuoteTarget(destination);
       if (!dry && data.quote?.depositAddress) {
         const item: Purchase = {
@@ -152,7 +155,9 @@ export default function Home() {
           inputSymbol: source.symbol, outputSymbol: targetName(destination), date: new Date().toISOString(),
           depositAddress: data.quote.depositAddress, depositMemo: data.quote.depositMemo,
         };
-        setPurchases((current) => [item, ...current.filter((purchase) => purchase.id !== item.id)]);
+        const saved = await api("/orbit/swaps", { method: "POST", body: JSON.stringify(item) });
+        item.id = saved.swap.id;
+        setPurchases((current) => [saved.swap, ...current.filter((purchase) => purchase.id !== saved.swap.id)]);
         setNotice("Deposit route created. Your funds remain in your wallet until you send them to the address below.");
       } else if (dry) setNotice("Live market quote received. Dry run did not create a deposit route or move funds.");
     } catch (reason) {
@@ -160,7 +165,7 @@ export default function Home() {
     } finally { setBusy(false); }
   }
 
-  function saveSchedule() {
+  async function saveSchedule() {
     setError(""); setNotice("");
     if (!origin || !target) return setError("Wait for the supported 1Click assets to load, then choose a route.");
     if (!recipient.trim() || !refundTo.trim()) return setError("Add the destination and refund addresses to save this plan.");
@@ -171,34 +176,29 @@ export default function Home() {
       targetAsset: target.assetId, targetSymbol, recipient: recipient.trim(), refundTo: refundTo.trim(),
       interval, slippage: Number(slippage), nextRun: nextDate(interval), active: true, createdAt: new Date().toISOString(),
     };
-    setSchedules((current) => [schedule, ...current]);
-    setNotice("Plan saved in this browser. Each buy still needs your confirmation and a wallet deposit.");
+    try { const result = await api("/orbit/schedules", { method: "POST", body: JSON.stringify(schedule) }); setSchedules((current) => [result.schedule, ...current]); setNotice("Plan saved to your DEN workspace. Each buy still needs your confirmation and a wallet deposit."); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not save plan."); }
   }
 
-  function toggleSchedule(id: string) {
-    setSchedules((current) => current.map((item) => item.id === id ? { ...item, active: !item.active } : item));
+  async function toggleSchedule(id: string) {
+    const item = schedules.find(schedule => schedule.id === id); if (!item) return;
+    try { const result = await api(`/orbit/schedules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ active: !item.active }) }); setSchedules(current => current.map(schedule => schedule.id === id ? result.schedule : schedule)); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not update plan."); }
   }
 
   async function checkStatus(purchase: Purchase) {
     if (!purchase.depositAddress) return;
     setBusy(true); setError("");
     try {
-      const params = new URLSearchParams({ depositAddress: purchase.depositAddress });
-      if (purchase.depositMemo) params.set("depositMemo", purchase.depositMemo);
-      const response = await fetch(`/api/intents/status?${params.toString()}`);
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error ?? result.message ?? "Could not check swap status.");
+      const response = await api(`/orbit/swaps/${encodeURIComponent(purchase.id)}/status`, { method: "POST", body: "{}" });
+      const result = response;
       const status = String(result.status ?? "UNKNOWN");
       const hashes = result.swapDetails?.destinationChainTxHashes ?? result.swapDetails?.originChainTxHashes ?? [];
-      const updated: Purchase = {
+      const updated: Purchase = result.swap ?? {
         ...purchase, status,
         amountOut: result.swapDetails?.amountOutFormatted ?? purchase.amountOut,
         explorerUrl: hashes[0]?.explorerUrl || explorerFor(purchase.depositAddress),
       };
       setPurchases((current) => current.map((item) => item.id === purchase.id ? updated : item));
-      if (status === "SUCCESS" && purchase.scheduleId) {
-        setSchedules((current) => current.map((item) => item.id === purchase.scheduleId ? { ...item, nextRun: nextDate(item.interval) } : item));
-      }
+      if (status === "SUCCESS" && purchase.scheduleId) { const plans = await api("/orbit/schedules"); setSchedules(plans.schedules ?? []); }
       setNotice(`Swap status: ${status.replaceAll("_", " ")}.`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not check swap status."); }
     finally { setBusy(false); }
@@ -250,9 +250,9 @@ export default function Home() {
 
         <aside className="side-column">
           <div className="panel schedule-panel" id="plans"><div className="panel-heading compact"><div><div className="section-kicker">YOUR ROUTINE</div><h2>Upcoming buys</h2></div><span className="count-badge">{activeSchedules}</span></div>
-            {schedules.length ? <div className="schedule-list">{schedules.slice(0, 4).map((schedule) => <article className={`schedule-item ${!schedule.active ? "paused" : ""}`} key={schedule.id}><div className="coin-badge">{schedule.targetSymbol === "BTC" ? "₿" : schedule.targetSymbol === "ETH" ? "Ξ" : "N"}</div><div className="schedule-info"><b>{schedule.amount} USDC <span>→ {schedule.targetSymbol}</span></b><small>{schedule.active ? `${schedule.interval} · next ${new Date(schedule.nextRun).toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Paused"}</small><button className="run-quote-link" onClick={() => requestQuote(!liveMode, schedule)} disabled={!schedule.active || busy}>Run quote ↗</button></div><button className="pause-button" onClick={() => toggleSchedule(schedule.id)}>{schedule.active ? "Pause" : "Resume"}</button></article>)}</div> : <div className="empty-state"><div className="empty-orbit">↗</div><b>Your first plan starts here</b><p>Choose an amount and rhythm. Your plan stays saved in this browser.</p></div>}
+            {schedules.length ? <div className="schedule-list">{schedules.slice(0, 4).map((schedule) => <article className={`schedule-item ${!schedule.active ? "paused" : ""}`} key={schedule.id}><div className="coin-badge">{schedule.targetSymbol === "BTC" ? "₿" : schedule.targetSymbol === "ETH" ? "Ξ" : "N"}</div><div className="schedule-info"><b>{schedule.amount} USDC <span>→ {schedule.targetSymbol}</span></b><small>{schedule.active ? `${schedule.interval} · next ${new Date(schedule.nextRun).toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : "Paused"}</small><button className="run-quote-link" onClick={() => requestQuote(!liveMode, schedule)} disabled={!schedule.active || busy}>Run quote ↗</button></div><button className="pause-button" onClick={() => toggleSchedule(schedule.id)}>{schedule.active ? "Pause" : "Resume"}</button></article>)}</div> : <div className="empty-state"><div className="empty-orbit">↗</div><b>Your first plan starts here</b><p>Choose an amount and rhythm. Your plan stays saved in your DEN account.</p></div>}
             <button className="outline-button" onClick={saveSchedule}>Save this plan <span>＋</span></button>
-            <div className="schedule-footnote"><span>i</span><p>Plans are stored in this browser. Run a quote when it’s due; every transfer needs your wallet approval.</p></div>
+            <div className="schedule-footnote"><span>i</span><p>Plans are stored in your DEN account. Every transfer needs your wallet approval.</p></div>
           </div>
           <div className="intent-note"><div className="intent-symbol">N</div><div><span>POWERED BY</span><b>NEAR Intents</b><p>One request. Liquidity across chains.</p></div><a href="https://docs.near-intents.org/" target="_blank" rel="noreferrer" aria-label="Learn about NEAR Intents">↗</a></div>
         </aside>
